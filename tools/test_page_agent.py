@@ -24,8 +24,17 @@ HARNESS = (
     + r"""
 
 // ---- fake DOM -------------------------------------------------------------
-// The real observer fires on a microtask; firing synchronously is stricter,
-// since a reentrant write would show up as a hang rather than pass silently.
+// Models browser behavior pinned down by experiment in the PDF viewer:
+//   - The visible TAB title and document.title are separate. The viewer sets
+//     the tab directly (viewerSetsTab) without touching document.title, so the
+//     two can disagree.
+//   - A document.title assignment counts as a change (propagates to the tab,
+//     fires the observer) only when its trimmed value differs from the previous
+//     document.title. Re-writing the same value, or a whitespace-only edit, is
+//     ignored, even when the tab is currently showing something else.
+// The observer fires synchronously here; the real one is a microtask, but sync
+// is stricter, since a reentrant write shows up as a hang instead of passing.
+const norm = (t) => (t ?? "").trim();
 let observers = [];
 globalThis.MutationObserver = class {
   constructor(cb) { this.cb = cb; observers.push(this); }
@@ -37,10 +46,15 @@ let depth = 0;
 const doc = {
   head: {},
   contentType: "text/html",
-  _t: "",
-  get title() { return this._t; },
+  _doc: "", // document.title backing store
+  _last: "", // last document.title value the browser propagated (change baseline)
+  _tab: "", // the visible tab title
+  get title() { return this._doc; },
   set title(v) {
-    this._t = v;
+    this._doc = v;
+    if (norm(v) === norm(this._last)) return; // browser ignores a non-change
+    this._last = v;
+    this._tab = v; // a real change propagates to the tab
     if (++depth > 50) throw new Error("runaway title writes");
     for (const o of observers) if (o.on) o.cb();
     depth--;
@@ -48,8 +62,14 @@ const doc = {
 };
 globalThis.document = doc;
 
-function reset(title) { globalThis.window = {}; observers = []; doc._t = title; }
-function pageSets(title) { doc._t = title; for (const o of observers) if (o.on) o.cb(); }
+function reset(title) {
+  globalThis.window = {};
+  observers = [];
+  doc._doc = doc._last = doc._tab = title;
+}
+function pageSets(title) { doc.title = title; } // a page retitling itself
+function viewerSetsTab(title) { doc._tab = title; } // PDF viewer: tab only
+function tab() { return doc._tab; }
 
 let failed = 0;
 function check(label, got, want) {
@@ -116,43 +136,39 @@ pageAgent("[Research] ", "");
 pageAgent("", "");
 check("restores after a single apply", doc.title, "Wikipedia");
 
-// ---- a retitle the observer cannot see -------------------------------------
-// Chrome's PDF viewer sets the title from file metadata after the page loads,
-// without a <title> mutation, so the agent never hears about it. Assigning to
-// doc._t writes the backing field directly, firing no observer, which is what
-// that looks like from inside the page. Re-injecting has to re-read the title
-// instead of trusting the base it captured while the document was still empty.
-reset("");
-pageAgent("[Research] ", ""); // injected mid-load, title still empty
-doc._t = "annual-report.pdf"; // the viewer writes; no callback fires
-pageAgent("[Research] ", ""); // service worker spotted the divergence
-check("silent retitle recovered", doc.title, "[Research] annual-report.pdf");
+// ---- PDF viewer: the tab title set out of band -----------------------------
+// The viewer sets the TAB title from file metadata, not document.title, and the
+// browser treats re-writing document.title's current value as a no-op. Together
+// that is the local-file bug: once the viewer desyncs the tab, the target title
+// is already in document.title, so a plain re-write cannot push it to the tab.
 
-pageAgent("", "");
-check("silent retitle unwinds cleanly", doc.title, "annual-report.pdf");
+// First apply on load, document.title and tab still agree.
+reset("_ICLR.pdf");
+pageAgent("[vesteinn] ", "", "_ICLR.pdf");
+check("pdf first apply reaches the tab", tab(), "[vesteinn] _ICLR.pdf");
 
-// The same divergence on the strip path: a prefix must come off even when the
-// agent's cached base is stale, or it strands on an inactive tab.
-reset("report.pdf");
-pageAgent("[Research] ", "");
-doc._t = "[Research] renamed.pdf"; // silent retitle, prefix still present
-pageAgent("", "");
-check("strip survives a silent retitle", doc.title, "renamed.pdf");
+// The viewer re-asserts the bare filename on the TAB only; document.title keeps
+// the prefix, so the group name vanishes from the tab.
+viewerSetsTab("_ICLR.pdf");
+check("viewer can desync the tab", tab(), "_ICLR.pdf");
+check("document.title still holds the prefix", doc.title, "[vesteinn] _ICLR.pdf");
 
-// ---- a tab title the document never sees -----------------------------------
-// Chrome's PDF viewer sets the *tab* title from the file's metadata without
-// touching document.title, so the document keeps the filename while the user
-// sees "Annual Report 2025". Building on document.title discards the real name.
+// The settle loop re-injects with the real tab title. document.title already
+// equals the target, so recovery must nudge through the bare base. Every earlier
+// version got this case wrong.
+pageAgent("[vesteinn] ", "", "_ICLR.pdf");
+check("desync recovered on the tab", tab(), "[vesteinn] _ICLR.pdf");
+
+// A viewer metadata name that differs from the filename is adopted on the tab.
 reset("annual-report.pdf");
 pageAgent("[Research] ", "", "annual-report.pdf");
-check("pdf first apply", doc.title, "[Research] annual-report.pdf");
-
-// The viewer's metadata write: tab title only, document.title untouched.
+viewerSetsTab("Annual Report 2025");
 pageAgent("[Research] ", "", "Annual Report 2025");
-check("metadata name adopted", doc.title, "[Research] Annual Report 2025");
+check("metadata name adopted on the tab", tab(), "[Research] Annual Report 2025");
 
+// Removing the prefix restores the bare name on the tab.
 pageAgent("", "", "[Research] Annual Report 2025");
-check("metadata name survives strip", doc.title, "Annual Report 2025");
+check("prefix removal reaches the tab", tab(), "Annual Report 2025");
 
 // ---- titles that look like prefixes ---------------------------------------
 reset("[Draft] Design doc");
