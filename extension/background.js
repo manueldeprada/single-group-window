@@ -237,6 +237,52 @@ const refreshAll = async () => {
   }
 };
 
+// A page load can settle its title *after* "complete", with nothing to hook.
+// Chrome's PDF viewer writes the file's name to the tab afterward; for local
+// file:// documents the plugin may not even accept an injected script until a
+// beat later, so the attempt at "complete" fails outright. Remote PDFs recover
+// because the viewer's metadata write fires tabs.onUpdated with a title, which
+// retries; local files fire no such event, so the prefix stays missing until
+// the tab is re-activated by hand. Re-read the real tab title shortly after load
+// and re-apply if the prefix is not there, independent of any event.
+const RECONCILE_MS = 400;
+const reconcilers = new Map();
+
+function cancelReconcile(tabId) {
+  clearTimeout(reconcilers.get(tabId));
+  reconcilers.delete(tabId);
+}
+
+function scheduleReconcile(tabId, windowId, tries = 0) {
+  cancelReconcile(tabId);
+  reconcilers.set(
+    tabId,
+    setTimeout(() => {
+      reconcilers.delete(tabId);
+      queue(() => reconcile(tabId, windowId, tries));
+    }, RECONCILE_MS),
+  );
+}
+
+async function reconcile(tabId, windowId, tries) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return; // tab gone
+  }
+  if (!tab.active || tab.status === "loading") return;
+
+  const prefix = (await titlesEnabled()) ? await prefixFor(tab) : "";
+  if (!prefix) return; // nothing should be applied on this tab
+  if ((tab.title ?? "").startsWith(prefix)) return; // already correct
+  if (tries >= MAX_DIVERGENCE) return; // give up rather than chase forever
+
+  applied.delete(tabId); // force setPrefix past its cache and actually re-inject
+  await refreshWindow(windowId);
+  scheduleReconcile(tabId, windowId, tries + 1);
+}
+
 chrome.tabs.onActivated.addListener(({ windowId }) => scheduleRefresh(windowId));
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -248,6 +294,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status) {
     applied.delete(tabId);
     diverged.delete(tabId);
+    cancelReconcile(tabId); // a stale reconcile from the previous load is moot
   }
 
   // A background tab joining or leaving the group changes whether the window
@@ -271,7 +318,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     return scheduleRefresh(tab.windowId);
   }
 
-  if (changeInfo.status === "complete") scheduleRefresh(tab.windowId);
+  if (changeInfo.status === "complete") {
+    scheduleRefresh(tab.windowId);
+    scheduleReconcile(tabId, tab.windowId); // catch a title that settles later
+  }
 });
 
 // Closing or dragging a tab can make a window qualify or stop qualifying
@@ -281,6 +331,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 chrome.tabs.onRemoved.addListener((tabId, { windowId, isWindowClosing }) => {
   applied.delete(tabId);
   diverged.delete(tabId);
+  cancelReconcile(tabId);
   if (!isWindowClosing) scheduleRefresh(windowId);
 });
 chrome.tabs.onAttached.addListener((_id, { newWindowId }) =>

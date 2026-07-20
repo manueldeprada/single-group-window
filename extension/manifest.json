@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Single-group window",
   "description": "In a window that is exactly one tab group, new tabs join the group and the window title carries the group name.",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "minimum_chrome_version": "102",
   "permissions": [
     "tabs",

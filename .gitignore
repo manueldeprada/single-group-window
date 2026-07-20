@@ -5,3 +5,5 @@ dist
 .png_backup/
 *.png
 !extension/icons/*.png
+*.pdf
+CLAUDE.md
